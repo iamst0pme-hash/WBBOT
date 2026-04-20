@@ -10,8 +10,8 @@ MSK = timezone(timedelta(hours=3))
 _CARDS_CACHE_TTL = 1800.0
 _SALES_HISTORY_CACHE_TTL = 300.0
 _HISTORY_REQUEST_MIN_INTERVAL = 1.0
-_HISTORY_MIN_CHUNK_SIZE = 10
-_HISTORY_MAX_CHUNK_SIZE = 100
+_HISTORY_MIN_CHUNK_SIZE = 5
+_HISTORY_MAX_CHUNK_SIZE = 20
 
 _cards_cache: dict[str, tuple[float, object]] = {}
 _sales_history_cache: dict[tuple, tuple[float, list]] = {}
@@ -98,13 +98,8 @@ async def _fetch_sales_history_chunk(
     payload = {
         "selectedPeriod": {"start": date_start, "end": date_end},
         "nmIds": chunk,
-        "brandNames": [],
-        "subjectIds": [],
-        "tagIds": [],
         "skipDeletedNm": False,
-        "orderBy": {"field": "ordersSumRub", "mode": "desc"},
-        "limit": min(max(len(chunk), 100), 1000),
-        "offset": 0,
+        "aggregationLevel": "day",
     }
 
     try:
