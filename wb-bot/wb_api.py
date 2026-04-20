@@ -5,6 +5,63 @@ import httpx
 
 MSK = timezone(timedelta(hours=3))
 
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code < 600
+
+
+def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(float(retry_after), 1.0)
+            except ValueError:
+                pass
+    # 2, 4, 8, 16, 20 seconds
+    return min(2 ** attempt, 20)
+
+
+async def _request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    attempts: int = 5,
+    sleep_before: float = 0.0,
+    **kwargs,
+) -> httpx.Response:
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        if sleep_before > 0:
+            await asyncio.sleep(sleep_before)
+        try:
+            response = await client.request(method, url, **kwargs)
+            if not _is_retryable_status(response.status_code):
+                response.raise_for_status()
+                return response
+
+            last_error = httpx.HTTPStatusError(
+                f"Retryable status {response.status_code} for url '{url}'",
+                request=response.request,
+                response=response,
+            )
+            if attempt == attempts:
+                response.raise_for_status()
+            await asyncio.sleep(_retry_delay(response, attempt))
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.NetworkError) as e:
+            last_error = e
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(min(2 ** attempt, 20))
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Request failed without a specific error")
+
+
+MSK = timezone(timedelta(hours=3))
 def msk_date(days_ago: int) -> str:
     return (datetime.now(MSK) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
 
@@ -56,9 +113,18 @@ async def get_card_map(client: httpx.AsyncClient) -> dict:
 
 async def get_sales_history(client: httpx.AsyncClient, nm_ids: list[int], date_start: str, date_end: str) -> list:
     results = []
-    for i in range(0, len(nm_ids), 20):
-        chunk = nm_ids[i:i+20]
-        resp = await client.post(
+    if not nm_ids:
+        return results
+
+    # Делаем меньше запросов и даём WB больше времени между чанками,
+    # иначе seller-analytics-api часто отвечает 429 даже на коротком периоде.
+    chunk_size = 100
+
+    for i in range(0, len(nm_ids), chunk_size):
+        chunk = nm_ids[i:i + chunk_size]
+        resp = await _request_with_retry(
+            client,
+            "POST",
             "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products/history",
             json={
                 "selectedPeriod": {"start": date_start, "end": date_end},
@@ -66,14 +132,18 @@ async def get_sales_history(client: httpx.AsyncClient, nm_ids: list[int], date_s
                 "brandNames": [], "subjectIds": [], "tagIds": [],
                 "skipDeletedNm": False,
                 "orderBy": {"field": "ordersSumRub", "mode": "desc"},
-                "limit": 20, "offset": 0,
+                # limit должен покрывать весь переданный чанк, иначе часть nmIds может не вернуться
+                "limit": max(len(chunk), 100),
+                "offset": 0,
             },
             headers=HEADERS,
+            attempts=6,
+            sleep_before=1.5 if i > 0 else 0.0,
         )
-        resp.raise_for_status()
         body = resp.json()
         rows = body if isinstance(body, list) else body.get("data") or []
         results.extend(rows)
+
     return results
 
 # ─── СКЛАД ────────────────────────────────────────────────────────────────────
