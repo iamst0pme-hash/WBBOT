@@ -387,6 +387,23 @@ def _build_sales_text(period_cfg: dict, current_rows: list[dict], previous_rows:
     return "\n".join(lines)
 
 
+async def _get_sales_history_with_retry(client: httpx.AsyncClient, nm_ids: list[int], date_from: str, date_to: str, attempts: int = 4) -> list[dict]:
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await wb_api.get_sales_history(client, nm_ids, date_from, date_to)
+        except Exception as e:
+            last_error = e
+            message = str(e)
+            is_rate_limit = ('429' in message) or ('Too Many Requests' in message)
+            if not is_rate_limit or attempt == attempts:
+                raise
+            await asyncio.sleep(min(2 * attempt, 8))
+
+    raise last_error
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     register_chat(message.chat.id)
@@ -436,7 +453,7 @@ async def cb_sales_back(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("sales_period:"))
 async def cb_sales_period(call: CallbackQuery):
-    await call.answer()
+    await call.answer("⏳ Запрос в обработке...")
     register_chat(call.message.chat.id)
 
     period_key = call.data.split(":", 1)[1]
@@ -446,24 +463,25 @@ async def cb_sales_period(call: CallbackQuery):
         await call.message.answer(f"❌ Ошибка периода: {e}", reply_markup=MENU_KB)
         return
 
-    msg = await call.message.answer("⏳ Загружаю данные по продажам...")
+    msg = await call.message.answer("⏳ Запрос в обработке, собираю данные по продажам...")
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             nm_ids = await wb_api.get_cards(client)
 
-            current_rows, previous_rows = await asyncio.gather(
-                wb_api.get_sales_history(
-                    client,
-                    nm_ids,
-                    _date_str(period_cfg["current_start"]),
-                    _date_str(period_cfg["current_end"]),
-                ),
-                wb_api.get_sales_history(
-                    client,
-                    nm_ids,
-                    _date_str(period_cfg["previous_start"]),
-                    _date_str(period_cfg["previous_end"]),
-                ),
+            current_rows = await _get_sales_history_with_retry(
+                client,
+                nm_ids,
+                _date_str(period_cfg["current_start"]),
+                _date_str(period_cfg["current_end"]),
+            )
+
+            await asyncio.sleep(1.5)
+
+            previous_rows = await _get_sales_history_with_retry(
+                client,
+                nm_ids,
+                _date_str(period_cfg["previous_start"]),
+                _date_str(period_cfg["previous_end"]),
             )
 
         text = _build_sales_text(period_cfg, current_rows or [], previous_rows or [])
@@ -471,7 +489,14 @@ async def cb_sales_period(call: CallbackQuery):
         await call.message.answer(text, parse_mode="Markdown", reply_markup=MENU_KB)
     except Exception as e:
         await msg.delete()
-        await call.message.answer(f"❌ Ошибка: {e}", reply_markup=MENU_KB)
+        message = str(e)
+        if '429' in message or 'Too Many Requests' in message:
+            await call.message.answer(
+                "❌ Wildberries временно ограничил запросы (429 Too Many Requests). Попробуй ещё раз через 10–30 секунд.",
+                reply_markup=MENU_KB,
+            )
+        else:
+            await call.message.answer(f"❌ Ошибка: {e}", reply_markup=MENU_KB)
 
 
 # ─── СКЛАД ────────────────────────────────────────────────────────────────────
