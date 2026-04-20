@@ -1,9 +1,145 @@
 import asyncio
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import httpx
 
 MSK = timezone(timedelta(hours=3))
+
+
+_CARDS_CACHE_TTL = 1800.0
+_SALES_HISTORY_CACHE_TTL = 300.0
+_HISTORY_REQUEST_MIN_INTERVAL = 1.0
+_HISTORY_MIN_CHUNK_SIZE = 10
+_HISTORY_MAX_CHUNK_SIZE = 100
+
+_cards_cache: dict[str, tuple[float, object]] = {}
+_sales_history_cache: dict[tuple, tuple[float, list]] = {}
+_history_request_lock = asyncio.Lock()
+_last_history_request_at = 0.0
+
+
+def _now_ts() -> float:
+    return time.monotonic()
+
+
+def _cache_get(cache: dict, key):
+    entry = cache.get(key)
+    if not entry:
+        return None
+    expires_at, value = entry
+    if expires_at <= _now_ts():
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(cache: dict, key, value, ttl: float) -> None:
+    cache[key] = (_now_ts() + ttl, value)
+
+
+def _dedupe_ints(values: list[int]) -> list[int]:
+    seen = set()
+    result = []
+    for value in values:
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            continue
+        if ivalue <= 0 or ivalue in seen:
+            continue
+        seen.add(ivalue)
+        result.append(ivalue)
+    return result
+
+
+async def _history_post(client: httpx.AsyncClient, payload: dict, *, attempts: int = 5) -> httpx.Response:
+    global _last_history_request_at
+
+    for attempt in range(1, attempts + 1):
+        async with _history_request_lock:
+            wait_for = _HISTORY_REQUEST_MIN_INTERVAL - (_now_ts() - _last_history_request_at)
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+
+            response = await client.post(
+                "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products/history",
+                json=payload,
+                headers=HEADERS,
+            )
+            _last_history_request_at = _now_ts()
+
+        if not _is_retryable_status(response.status_code):
+            response.raise_for_status()
+            return response
+
+        if response.status_code == 429 and attempt < attempts:
+            await asyncio.sleep(_retry_delay(response, attempt))
+            continue
+
+        if 500 <= response.status_code < 600 and attempt < attempts:
+            await asyncio.sleep(_retry_delay(response, attempt))
+            continue
+
+        response.raise_for_status()
+
+    raise RuntimeError("History request retry loop ended unexpectedly")
+
+
+async def _fetch_sales_history_chunk(
+    client: httpx.AsyncClient,
+    chunk: list[int],
+    date_start: str,
+    date_end: str,
+) -> list:
+    if not chunk:
+        return []
+
+    payload = {
+        "selectedPeriod": {"start": date_start, "end": date_end},
+        "nmIds": chunk,
+        "brandNames": [],
+        "subjectIds": [],
+        "tagIds": [],
+        "skipDeletedNm": False,
+        "orderBy": {"field": "ordersSumRub", "mode": "desc"},
+        "limit": min(max(len(chunk), 100), 1000),
+        "offset": 0,
+    }
+
+    try:
+        response = await _history_post(client, payload, attempts=5)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 429 and len(chunk) > _HISTORY_MIN_CHUNK_SIZE:
+            middle = max(1, len(chunk) // 2)
+            left = await _fetch_sales_history_chunk(client, chunk[:middle], date_start, date_end)
+            right = await _fetch_sales_history_chunk(client, chunk[middle:], date_start, date_end)
+            return left + right
+        raise
+
+    body = response.json()
+    rows = body if isinstance(body, list) else body.get("data") or []
+    return rows if isinstance(rows, list) else []
+
+
+async def _get_cards_raw(client: httpx.AsyncClient) -> list[dict]:
+    cached = _cache_get(_cards_cache, "cards_raw")
+    if cached is not None:
+        return cached
+
+    resp = await client.post(
+        "https://content-api.wildberries.ru/content/v2/get/cards/list",
+        json={"settings": {"sort": {"ascending": False}, "cursor": {"limit": 100}, "filter": {"withPhoto": -1}}},
+        headers=HEADERS,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    cards = data.get("cards") or data.get("data", {}).get("cards") or []
+    if not isinstance(cards, list):
+        cards = []
+    _cache_set(_cards_cache, "cards_raw", cards, _CARDS_CACHE_TTL)
+    return cards
 
 
 def _is_retryable_status(status_code: int) -> bool:
@@ -61,7 +197,6 @@ async def _request_with_retry(
     raise RuntimeError("Request failed without a specific error")
 
 
-MSK = timezone(timedelta(hours=3))
 def msk_date(days_ago: int) -> str:
     return (datetime.now(MSK) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
 
@@ -80,30 +215,16 @@ def init(api_key: str, ads_key: str = None, finance_key: str = None):
 # ─── КАРТОЧКИ ────────────────────────────────────────────────────────────────
 
 async def get_cards(client: httpx.AsyncClient) -> list[int]:
-    resp = await client.post(
-        "https://content-api.wildberries.ru/content/v2/get/cards/list",
-        json={"settings": {"sort": {"ascending": False}, "cursor": {"limit": 100}, "filter": {"withPhoto": -1}}},
-        headers=HEADERS,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    cards = data.get("cards") or data.get("data", {}).get("cards") or []
-    return list({int(c.get("nmID") or c.get("nmId") or 0) for c in cards if c.get("nmID") or c.get("nmId")})
+    cards = await _get_cards_raw(client)
+    return _dedupe_ints([int(c.get("nmID") or c.get("nmId") or 0) for c in cards])
 
 async def get_card_map(client: httpx.AsyncClient) -> dict:
     """Возвращает {nmId: {vendorCode, rating, feedbacksCount}}"""
-    resp = await client.post(
-        "https://content-api.wildberries.ru/content/v2/get/cards/list",
-        json={"settings": {"sort": {"ascending": False}, "cursor": {"limit": 100}, "filter": {"withPhoto": -1}}},
-        headers=HEADERS,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    cards = data.get("cards") or data.get("data", {}).get("cards") or []
+    cards = await _get_cards_raw(client)
     return {
         int(c.get("nmID") or c.get("nmId") or 0): {
-            "vendorCode":     c.get("vendorCode") or "",
-            "rating":         float(c.get("rating") or 0),
+            "vendorCode": c.get("vendorCode") or "",
+            "rating": float(c.get("rating") or 0),
             "feedbacksCount": int(c.get("feedbacksCount") or 0),
         }
         for c in cards if c.get("nmID") or c.get("nmId")
@@ -112,38 +233,22 @@ async def get_card_map(client: httpx.AsyncClient) -> dict:
 # ─── ПРОДАЖИ ─────────────────────────────────────────────────────────────────
 
 async def get_sales_history(client: httpx.AsyncClient, nm_ids: list[int], date_start: str, date_end: str) -> list:
+    unique_nm_ids = _dedupe_ints(nm_ids)
+    if not unique_nm_ids:
+        return []
+
+    cache_key = (date_start, date_end, tuple(unique_nm_ids))
+    cached = _cache_get(_sales_history_cache, cache_key)
+    if cached is not None:
+        return list(cached)
+
     results = []
-    if not nm_ids:
-        return results
-
-    # Делаем меньше запросов и даём WB больше времени между чанками,
-    # иначе seller-analytics-api часто отвечает 429 даже на коротком периоде.
-    chunk_size = 100
-
-    for i in range(0, len(nm_ids), chunk_size):
-        chunk = nm_ids[i:i + chunk_size]
-        resp = await _request_with_retry(
-            client,
-            "POST",
-            "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products/history",
-            json={
-                "selectedPeriod": {"start": date_start, "end": date_end},
-                "nmIds": chunk,
-                "brandNames": [], "subjectIds": [], "tagIds": [],
-                "skipDeletedNm": False,
-                "orderBy": {"field": "ordersSumRub", "mode": "desc"},
-                # limit должен покрывать весь переданный чанк, иначе часть nmIds может не вернуться
-                "limit": max(len(chunk), 100),
-                "offset": 0,
-            },
-            headers=HEADERS,
-            attempts=6,
-            sleep_before=1.5 if i > 0 else 0.0,
-        )
-        body = resp.json()
-        rows = body if isinstance(body, list) else body.get("data") or []
+    for i in range(0, len(unique_nm_ids), _HISTORY_MAX_CHUNK_SIZE):
+        chunk = unique_nm_ids[i:i + _HISTORY_MAX_CHUNK_SIZE]
+        rows = await _fetch_sales_history_chunk(client, chunk, date_start, date_end)
         results.extend(rows)
 
+    _cache_set(_sales_history_cache, cache_key, list(results), _SALES_HISTORY_CACHE_TTL)
     return results
 
 # ─── СКЛАД ────────────────────────────────────────────────────────────────────
