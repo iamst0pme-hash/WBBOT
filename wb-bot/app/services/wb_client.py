@@ -63,13 +63,27 @@ class WBClient:
 
         results: list[SalesRow] = []
         for item in current_rows:
-            nm_id = self._to_int(item.get("nmId"))
+            if not isinstance(item, dict):
+                continue
+
+            nm_id = self._to_int(item.get("nmId") or item.get("nmID"))
+            product = item.get("product") if isinstance(item.get("product"), dict) else {}
+            if nm_id is None:
+                nm_id = self._to_int(product.get("nmId") or product.get("nmID"))
             if nm_id is None:
                 continue
 
-            product = item.get("product") or {}
-            selected = (item.get("statistic") or {}).get("selected") or item.get("selectedPeriod") or item.get("selected") or {}
-            past = (item.get("statistic") or {}).get("past") or item.get("pastPeriod") or item.get("past") or {}
+            statistic = item.get("statistic") if isinstance(item.get("statistic"), dict) else {}
+            selected = self._pick_mapping(
+                statistic.get("selected"),
+                item.get("selectedPeriod"),
+                item.get("selected"),
+            )
+            past = self._pick_mapping(
+                statistic.get("past"),
+                item.get("pastPeriod"),
+                item.get("past"),
+            )
 
             vendor_article = self._clean_text(
                 product.get("vendorCode")
@@ -128,16 +142,18 @@ class WBClient:
                     "filter": {"withPhoto": -1},
                 }
             }
-            data = await self._post_json(self.CONTENT_URL, payload)
-            payload_cards = data.get("cards") or data.get("data", {}).get("cards") or data.get("data") or []
+            raw = await self._post_json(self.CONTENT_URL, payload)
+            payload_cards = self._extract_cards(raw)
             for item in payload_cards:
+                if not isinstance(item, dict):
+                    continue
                 nm_id = self._to_int(item.get("nmID") or item.get("nmId"))
                 if nm_id is None:
                     continue
                 vendor_article = self._extract_vendor_article(item)
                 cards.append(ProductCard(nm_id=nm_id, vendor_article=vendor_article or str(nm_id)))
 
-            cursor_resp = data.get("cursor") or {}
+            cursor_resp = self._extract_cursor(raw)
             total = self._to_int(cursor_resp.get("total")) or len(payload_cards)
             limit = self._to_int(cursor.get("limit")) or 100
             if total < limit or not payload_cards:
@@ -181,8 +197,8 @@ class WBClient:
                 "timezone": "Europe/Moscow",
                 "aggregationLevel": "day",
             }
-            data = await self._post_json(self.HISTORY_URL, payload, retries=4, base_delay=22.0)
-            rows.extend(data.get("data") or [])
+            raw = await self._post_json(self.HISTORY_URL, payload, retries=4, base_delay=22.0)
+            rows.extend(self._extract_items(raw))
             if index < len(chunks):
                 await asyncio.sleep(22.0)
         return rows
@@ -198,16 +214,18 @@ class WBClient:
                 "pagination": {"limit": limit, "offset": offset},
                 "filters": {"nmIDs": nm_ids},
             }
-            data = await self._post_json(self.STOCKS_URL, payload)
-            items = data.get("data") or data.get("items") or []
+            raw = await self._post_json(self.STOCKS_URL, payload)
+            items = self._extract_items(raw)
             if not items:
                 break
 
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 nm_id = self._to_int(item.get("nmId") or item.get("nmID"))
                 if nm_id is None:
                     continue
-                metrics = item.get("metrics") or {}
+                metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
                 stock_by_nm[nm_id] = self._to_number(
                     metrics.get("stockCount") or item.get("stockCount") or 0
                 )
@@ -226,7 +244,7 @@ class WBClient:
         *,
         retries: int = 3,
         base_delay: float = 2.0,
-    ) -> dict[str, Any]:
+    ) -> Any:
         last_error: Exception | None = None
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             for attempt in range(1, retries + 1):
@@ -249,20 +267,74 @@ class WBClient:
         raise WBApiError(f"Ошибка запроса WB API: {last_error}")
 
     @staticmethod
+    def _extract_cards(raw: Any) -> list[dict[str, Any]]:
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+        if not isinstance(raw, dict):
+            return []
+        direct = raw.get("cards")
+        if isinstance(direct, list):
+            return [x for x in direct if isinstance(x, dict)]
+        data = raw.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            cards = data.get("cards")
+            if isinstance(cards, list):
+                return [x for x in cards if isinstance(x, dict)]
+        return []
+
+    @staticmethod
+    def _extract_cursor(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        cursor = raw.get("cursor")
+        if isinstance(cursor, dict):
+            return cursor
+        data = raw.get("data")
+        if isinstance(data, dict):
+            cursor = data.get("cursor")
+            if isinstance(cursor, dict):
+                return cursor
+        return {}
+
+    @staticmethod
+    def _extract_items(raw: Any) -> list[dict[str, Any]]:
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+        if not isinstance(raw, dict):
+            return []
+        for key in ("data", "items", "products", "result"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+        return []
+
+    @staticmethod
+    def _pick_mapping(*values: Any) -> dict[str, Any]:
+        for value in values:
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        return item
+        return {}
+
+    @staticmethod
     def _extract_vendor_article(item: dict[str, Any]) -> str:
         vendor_article = item.get("vendorCode") or item.get("supplierArticle") or ""
         if vendor_article:
             return str(vendor_article).strip()
 
         sizes = item.get("sizes") or []
-        for size in sizes:
-            for stock in size.get("skus") or []:
-                if stock:
-                    return str(stock).strip()
-
-        dimensions = item.get("dimensions") or {}
-        if dimensions:
-            return str(item.get("nmID") or item.get("nmId") or "").strip()
+        if isinstance(sizes, list):
+            for size in sizes:
+                if not isinstance(size, dict):
+                    continue
+                for stock in size.get("skus") or []:
+                    if stock:
+                        return str(stock).strip()
 
         return str(item.get("nmID") or item.get("nmId") or "").strip()
 
@@ -276,7 +348,7 @@ class WBClient:
             return 0.0
         if isinstance(value, (int, float)):
             return float(value)
-        text = str(value).replace("\xa0", "").replace(" ", "").replace(",", ".")
+        text = str(value).replace(" ", "").replace(" ", "").replace(",", ".")
         try:
             return float(text)
         except ValueError:
