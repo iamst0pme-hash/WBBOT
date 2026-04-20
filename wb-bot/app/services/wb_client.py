@@ -35,7 +35,9 @@ class WBClient:
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key.strip()
         self._headers = {"Authorization": self.api_key}
-        self._timeout = httpx.Timeout(120.0, connect=30.0)
+        self._timeout = httpx.Timeout(60.0, connect=20.0)
+        self._analytics_min_interval = 22.0
+        self._last_analytics_request_monotonic = 0.0
 
     async def export_sales_report(
         self,
@@ -45,121 +47,18 @@ class WBClient:
         past_end: date,
     ) -> list[SalesRow]:
         cards = await self.get_all_cards()
-        current_items = await self.fetch_funnel_all(
+        article_by_nm = {card.nm_id: card.vendor_article for card in cards}
+
+        funnel_rows = await self.get_funnel_rows(
             start=current_start.isoformat(),
             end=current_end.isoformat(),
-        )
-        past_items = await self.fetch_funnel_all(
-            start=past_start.isoformat(),
-            end=past_end.isoformat(),
+            past_start=past_start.isoformat(),
+            past_end=past_end.isoformat(),
         )
 
-        article_by_nm: dict[int, str] = {card.nm_id: card.vendor_article for card in cards}
-        current_by_article = self._aggregate_funnel_rows(current_items, article_by_nm)
-        past_by_article = self._aggregate_funnel_rows(past_items, article_by_nm)
+        aggregated: dict[str, SalesRow] = {}
 
-        all_articles = sorted(set(current_by_article) | set(past_by_article))
-        rows: list[SalesRow] = []
-        for article_key in all_articles:
-            current = current_by_article.get(article_key, {})
-            past = past_by_article.get(article_key, {})
-            vendor_article = str(current.get("vendor_article") or past.get("vendor_article") or article_key).strip()
-            nm_id = self._to_int(current.get("nm_id") or past.get("nm_id")) or 0
-            orders_sum = self._to_number(current.get("orders_sum"))
-            past_sum = self._to_number(past.get("orders_sum"))
-            rows.append(
-                SalesRow(
-                    nm_id=nm_id,
-                    vendor_article=vendor_article,
-                    orders_qty=self._to_number(current.get("orders_qty")),
-                    orders_sum=orders_sum,
-                    stock_qty=self._to_number(current.get("stock_qty")),
-                    orders_sum_dynamic=orders_sum - past_sum,
-                )
-            )
-
-        rows.sort(key=lambda x: (x.orders_sum, x.orders_qty, x.vendor_article.casefold()), reverse=True)
-        return rows
-
-    async def get_all_cards(self) -> list[ProductCard]:
-        cards: list[ProductCard] = []
-        cursor_nm: int | None = None
-        cursor_updated: str | None = None
-        page = 0
-
-        while True:
-            page += 1
-            payload: dict[str, Any] = {
-                "settings": {
-                    "cursor": {"limit": 100},
-                    "filter": {"withPhoto": -1},
-                }
-            }
-            if cursor_nm:
-                payload["settings"]["cursor"]["nmID"] = cursor_nm
-            if cursor_updated:
-                payload["settings"]["cursor"]["updatedAt"] = cursor_updated
-
-            raw = await self._post_json(self.CONTENT_URL, payload, retries=4, base_delay=2.0)
-            page_cards = self._extract_cards(raw)
-            if not page_cards:
-                break
-
-            for item in page_cards:
-                nm_id = self._nm_id_from_any(item)
-                if not nm_id:
-                    continue
-                article = self._article_from_card(item) or str(nm_id)
-                cards.append(ProductCard(nm_id=nm_id, vendor_article=article))
-
-            cursor = self._extract_cursor(raw)
-            next_nm = self._to_int(cursor.get("nmID") or cursor.get("nmId"))
-            next_updated = str(cursor.get("updatedAt") or "").strip() or None
-            if not next_nm or next_nm == cursor_nm:
-                break
-
-            cursor_nm = next_nm
-            cursor_updated = next_updated
-            await asyncio.sleep(0.65)
-
-        uniq: dict[int, ProductCard] = {}
-        for card in cards:
-            uniq[card.nm_id] = card
-        return list(uniq.values())
-
-    async def fetch_funnel_all(self, start: str, end: str) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        limit = 1000
-        offset = 0
-        page = 0
-
-        while True:
-            page += 1
-            payload = {
-                "selectedPeriod": {"start": start, "end": end},
-                "timezone": "Europe/Moscow",
-                "orderBy": {"field": "ordersSumRub", "mode": "desc"},
-                "page": {"limit": limit, "offset": offset},
-            }
-            raw = await self._post_json(self.FUNNEL_URL, payload, retries=4, base_delay=5.0)
-            part = self._extract_items(raw)
-            items.extend(part)
-            if len(part) < limit:
-                break
-            offset += limit
-            await asyncio.sleep(0.65)
-
-        return items
-
-    def _aggregate_funnel_rows(
-        self,
-        items: list[dict[str, Any]],
-        article_by_nm: dict[int, str],
-    ) -> dict[str, dict[str, Any]]:
-        rows_by_article: dict[str, dict[str, Any]] = {}
-        stock_nm_seen_by_article: dict[str, set[int]] = {}
-
-        for item in items:
+        for item in funnel_rows:
             if not isinstance(item, dict):
                 continue
 
@@ -167,50 +66,44 @@ class WBClient:
             statistic = item.get("statistic") if isinstance(item.get("statistic"), dict) else {}
             selected = self._pick_mapping(
                 statistic.get("selected"),
-                item.get("selected"),
                 item.get("selectedPeriod"),
+                item.get("selected"),
+            )
+            past = self._pick_mapping(
+                statistic.get("past"),
+                item.get("pastPeriod"),
+                item.get("past"),
             )
 
-            nm_id = self._nm_id_from_any(product) or self._nm_id_from_any(item)
-            raw_article = self._clean_text(
+            nm_id = self._to_int(
+                item.get("nmId")
+                or item.get("nmID")
+                or product.get("nmId")
+                or product.get("nmID")
+            )
+            if nm_id is None:
+                continue
+
+            vendor_article = self._clean_text(
                 product.get("vendorCode")
                 or product.get("supplierArticle")
                 or item.get("vendorCode")
                 or item.get("supplierArticle")
                 or item.get("article")
                 or item.get("saName")
+                or article_by_nm.get(nm_id, "")
             )
-            preferred_article = article_by_nm.get(nm_id or 0, "")
-            article = self._choose_better_article(preferred_article, raw_article)
-            if not article:
-                if nm_id:
-                    article = article_by_nm.get(nm_id, str(nm_id))
-                else:
-                    continue
+            if not vendor_article:
+                vendor_article = str(nm_id)
 
-            article_key = self._canonical_article(article)
-            bucket = rows_by_article.get(article_key)
-            if bucket is None:
-                bucket = {
-                    "vendor_article": article,
-                    "nm_id": nm_id or 0,
-                    "orders_qty": 0.0,
-                    "orders_sum": 0.0,
-                    "stock_qty": 0.0,
-                }
-                rows_by_article[article_key] = bucket
-
-            if nm_id and not bucket.get("nm_id"):
-                bucket["nm_id"] = nm_id
-
-            qty = self._to_number(
+            orders_qty = self._to_number(
                 selected.get("orderCount")
                 or selected.get("ordersCount")
                 or item.get("orderCount")
                 or item.get("ordersCount")
                 or 0
             )
-            amount = self._to_number(
+            orders_sum = self._to_number(
                 selected.get("orderSum")
                 or selected.get("ordersSumRub")
                 or selected.get("sum")
@@ -219,21 +112,128 @@ class WBClient:
                 or item.get("sum")
                 or 0
             )
-            stocks = product.get("stocks") if isinstance(product.get("stocks"), dict) else {}
-            stock = self._to_number(stocks.get("wb") or item.get("stocksWb") or 0)
+            past_sum = self._to_number(
+                past.get("orderSum")
+                or past.get("ordersSumRub")
+                or past.get("sum")
+                or 0
+            )
+            stock_qty = self._to_number(
+                (product.get("stocks") or {}).get("wb") if isinstance(product.get("stocks"), dict) else None
+            )
+            if not stock_qty:
+                stock_qty = self._to_number(item.get("stocksWb") or item.get("stock") or 0)
 
-            bucket["orders_qty"] += qty
-            bucket["orders_sum"] += amount
-
-            if nm_id:
-                seen = stock_nm_seen_by_article.setdefault(article_key, set())
-                if nm_id not in seen:
-                    bucket["stock_qty"] += stock
-                    seen.add(nm_id)
+            key = vendor_article.casefold()
+            existing = aggregated.get(key)
+            if existing is None:
+                aggregated[key] = SalesRow(
+                    nm_id=nm_id,
+                    vendor_article=vendor_article,
+                    orders_qty=orders_qty,
+                    orders_sum=orders_sum,
+                    stock_qty=stock_qty,
+                    orders_sum_dynamic=orders_sum - past_sum,
+                )
             else:
-                bucket["stock_qty"] += stock
+                existing.orders_qty += orders_qty
+                existing.orders_sum += orders_sum
+                existing.stock_qty += stock_qty
+                existing.orders_sum_dynamic += orders_sum - past_sum
 
-        return rows_by_article
+        rows = list(aggregated.values())
+        rows.sort(key=lambda x: (x.orders_sum, x.orders_qty, x.vendor_article.casefold()), reverse=True)
+        return rows
+
+    async def get_all_cards(self) -> list[ProductCard]:
+        cards: list[ProductCard] = []
+        cursor: dict[str, Any] = {"limit": 100}
+
+        while True:
+            payload = {
+                "settings": {
+                    "cursor": cursor,
+                    "filter": {"withPhoto": -1},
+                }
+            }
+            raw = await self._post_json(self.CONTENT_URL, payload, retries=3, base_delay=2.0)
+            payload_cards = self._extract_cards(raw)
+            for item in payload_cards:
+                nm_id = self._to_int(item.get("nmID") or item.get("nmId"))
+                if nm_id is None:
+                    continue
+                vendor_article = self._extract_vendor_article(item)
+                cards.append(ProductCard(nm_id=nm_id, vendor_article=vendor_article or str(nm_id)))
+
+            if not payload_cards:
+                break
+
+            cursor_resp = self._extract_cursor(raw)
+            total = self._to_int(cursor_resp.get("total")) or len(payload_cards)
+            limit = self._to_int(cursor.get("limit")) or 100
+            if total < limit:
+                break
+
+            updated_at = cursor_resp.get("updatedAt")
+            nm_id_cursor = cursor_resp.get("nmID") or cursor_resp.get("nmId")
+            if not updated_at or nm_id_cursor is None:
+                break
+
+            cursor = {
+                "limit": limit,
+                "updatedAt": updated_at,
+                "nmID": nm_id_cursor,
+            }
+            await asyncio.sleep(0.65)
+
+        uniq: dict[int, ProductCard] = {}
+        for card in cards:
+            uniq[card.nm_id] = card
+        return list(uniq.values())
+
+    async def get_funnel_rows(
+        self,
+        *,
+        start: str,
+        end: str,
+        past_start: str,
+        past_end: str,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        limit = 1000
+        offset = 0
+
+        while True:
+            payload = {
+                "selectedPeriod": {"start": start, "end": end},
+                "pastPeriod": {"start": past_start, "end": past_end},
+                "nmIds": [],
+                "brandNames": [],
+                "subjectIds": [],
+                "tagIds": [],
+                "skipDeletedNm": True,
+                "orderBy": {"field": "openCard", "mode": "desc"},
+                "limit": limit,
+                "offset": offset,
+            }
+            raw = await self._post_json(self.FUNNEL_URL, payload, retries=4, base_delay=22.0)
+            part = self._extract_items(raw)
+            items.extend(part)
+            if len(part) < limit:
+                break
+            offset += limit
+            await asyncio.sleep(22.0)
+        return items
+
+    async def _wait_for_analytics_slot(self, url: str) -> None:
+        if "seller-analytics-api.wildberries.ru" not in url:
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        elapsed = now - self._last_analytics_request_monotonic
+        if self._last_analytics_request_monotonic and elapsed < self._analytics_min_interval:
+            await asyncio.sleep(self._analytics_min_interval - elapsed)
+        self._last_analytics_request_monotonic = loop.time()
 
     async def _post_json(
         self,
@@ -247,16 +247,23 @@ class WBClient:
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             for attempt in range(1, retries + 1):
                 try:
+                    await self._wait_for_analytics_slot(url)
                     response = await client.post(url, headers=self._headers, json=payload)
                     if response.status_code == 429:
                         retry_after = response.headers.get("Retry-After")
-                        delay = float(retry_after) if retry_after else base_delay * attempt
+                        delay = float(retry_after) if retry_after else max(base_delay * attempt, self._analytics_min_interval)
                         await asyncio.sleep(delay)
+                        self._last_analytics_request_monotonic = 0.0
                         last_error = WBApiError(f"429 Too Many Requests: {url}")
                         continue
-                    response.raise_for_status()
+                    if response.status_code >= 400:
+                        try:
+                            details = response.text[:1000]
+                        except Exception:
+                            details = ""
+                        raise WBApiError(f"{response.status_code} {response.reason_phrase}: {url}. {details}".strip())
                     return response.json()
-                except (httpx.HTTPError, ValueError) as exc:
+                except (httpx.HTTPError, ValueError, WBApiError) as exc:
                     last_error = exc
                     if attempt >= retries:
                         break
@@ -266,30 +273,34 @@ class WBClient:
 
     @staticmethod
     def _extract_cards(raw: Any) -> list[dict[str, Any]]:
-        if isinstance(raw, dict):
-            cards = raw.get("cards")
-            if isinstance(cards, list):
-                return [x for x in cards if isinstance(x, dict)]
-            data = raw.get("data")
-            if isinstance(data, dict):
-                nested_cards = data.get("cards")
-                if isinstance(nested_cards, list):
-                    return [x for x in nested_cards if isinstance(x, dict)]
         if isinstance(raw, list):
             return [x for x in raw if isinstance(x, dict)]
+        if not isinstance(raw, dict):
+            return []
+        direct = raw.get("cards")
+        if isinstance(direct, list):
+            return [x for x in direct if isinstance(x, dict)]
+        data = raw.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            cards = data.get("cards")
+            if isinstance(cards, list):
+                return [x for x in cards if isinstance(x, dict)]
         return []
 
     @staticmethod
     def _extract_cursor(raw: Any) -> dict[str, Any]:
-        if isinstance(raw, dict):
-            cursor = raw.get("cursor")
+        if not isinstance(raw, dict):
+            return {}
+        cursor = raw.get("cursor")
+        if isinstance(cursor, dict):
+            return cursor
+        data = raw.get("data")
+        if isinstance(data, dict):
+            cursor = data.get("cursor")
             if isinstance(cursor, dict):
                 return cursor
-            data = raw.get("data")
-            if isinstance(data, dict):
-                nested = data.get("cursor")
-                if isinstance(nested, dict):
-                    return nested
         return {}
 
     @staticmethod
@@ -298,13 +309,13 @@ class WBClient:
             return [x for x in raw if isinstance(x, dict)]
         if not isinstance(raw, dict):
             return []
-        for key in ("data", "items", "products", "result"):
+        for key in ("data", "items", "cards", "products", "result"):
             value = raw.get(key)
             if isinstance(value, list):
                 return [x for x in value if isinstance(x, dict)]
             if isinstance(value, dict):
-                for nested_key in ("items", "products", "data"):
-                    nested = value.get(nested_key)
+                for key2 in ("items", "cards", "products", "result"):
+                    nested = value.get(key2)
                     if isinstance(nested, list):
                         return [x for x in nested if isinstance(x, dict)]
         return []
@@ -314,79 +325,28 @@ class WBClient:
         for value in values:
             if isinstance(value, dict):
                 return value
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        return item
         return {}
 
     @staticmethod
-    def _nm_id_from_any(obj: Any) -> int | None:
-        if not isinstance(obj, dict):
-            return None
-        value = obj.get("nmID") or obj.get("nmId")
-        try:
-            return int(value) if value not in (None, "") else None
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _extract_candidate_articles(obj: Any) -> list[str]:
-        found: list[str] = []
-
-        def add(value: Any) -> None:
-            if isinstance(value, list):
-                for item in value:
-                    add(item)
-                return
-            txt = WBClient._clean_text(value)
-            if txt and txt not in found:
-                found.append(txt)
-
-        if not isinstance(obj, dict):
-            return found
-
-        for key in ("vendorCode", "supplierArticle", "article", "saName"):
-            add(obj.get(key))
-
-        sizes = obj.get("sizes")
+    def _extract_vendor_article(item: dict[str, Any]) -> str:
+        vendor_article = item.get("vendorCode") or item.get("supplierArticle") or item.get("article") or ""
+        if vendor_article:
+            return str(vendor_article).strip()
+        sizes = item.get("sizes") or []
         if isinstance(sizes, list):
             for size in sizes:
                 if not isinstance(size, dict):
                     continue
-                for key in ("vendorCode", "supplierArticle", "article"):
-                    add(size.get(key))
-
-        return found
-
-    @staticmethod
-    def _article_looks_like_barcode(article: str) -> bool:
-        txt = WBClient._clean_text(article)
-        if not txt:
-            return False
-        digits_only = "".join(ch for ch in txt if ch.isdigit())
-        if not digits_only:
-            return False
-        if digits_only == txt and len(digits_only) >= 8:
-            return True
-        return len(digits_only) >= 12 and len(digits_only) >= max(8, len(txt) - 2)
-
-    @classmethod
-    def _choose_better_article(cls, primary: str, secondary: str) -> str:
-        a = cls._clean_text(primary)
-        b = cls._clean_text(secondary)
-        if a and not cls._article_looks_like_barcode(a):
-            return a
-        if b and not cls._article_looks_like_barcode(b):
-            return b
-        return a or b
-
-    @classmethod
-    def _article_from_card(cls, card: dict[str, Any]) -> str:
-        best = ""
-        for art in cls._extract_candidate_articles(card):
-            best = cls._choose_better_article(best, art)
-        return best
-
-    @staticmethod
-    def _canonical_article(article: str) -> str:
-        return WBClient._clean_text(article).upper()
+                skus = size.get("skus") or []
+                if isinstance(skus, list):
+                    for sku in skus:
+                        if sku:
+                            return str(sku).strip()
+        return str(item.get("nmID") or item.get("nmId") or "").strip()
 
     @staticmethod
     def _clean_text(value: Any) -> str:
